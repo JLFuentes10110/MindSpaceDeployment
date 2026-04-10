@@ -1,3 +1,5 @@
+const BASE_URL = import.meta.env.VITE_API_URL || '';
+
 export const apiFetch = async (url, options = {}) => {
   const token = getAuthToken();
   const headers = {
@@ -7,7 +9,7 @@ export const apiFetch = async (url, options = {}) => {
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
-  const response = await fetch(url, {
+  const response = await fetch(`${BASE_URL}${url}`, {
     ...options,
     headers,
   });
@@ -15,7 +17,7 @@ export const apiFetch = async (url, options = {}) => {
     clearAuthToken();
     window.location.reload();
   }
-    const data = await response.json();
+  const data = await response.json();
 
   if (!response.ok) {
     const err = new Error(data?.detail || 'Request failed');
@@ -27,7 +29,5 @@ export const apiFetch = async (url, options = {}) => {
 };
 
 export const getAuthToken = () => localStorage.getItem('authToken');
-
 export const setAuthToken = (token) => localStorage.setItem('authToken', token);
-
 export const clearAuthToken = () => localStorage.removeItem('authToken');
