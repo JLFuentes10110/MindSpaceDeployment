@@ -2,9 +2,9 @@ services:
   - type: web
     name: mindspace-backend
     runtime: python
-    rootDir: MindSpace/backend
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    rootDir: MindSpace
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.api:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
         sync: false
