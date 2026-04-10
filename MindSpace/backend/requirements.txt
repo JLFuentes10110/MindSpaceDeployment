@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+requests
+passlib[pbkdf2-sha256]
+python-jose[cryptography]
+sqlalchemy
+psycopg2-binary
+python-dotenv
+groq

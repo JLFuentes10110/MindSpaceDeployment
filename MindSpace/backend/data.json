@@ -1,0 +1,17 @@
+{
+  "users": [
+    {
+      "id": "user-1773406045735",
+      "email": "",
+      "hashed_password": "$pbkdf2-sha256$29000$5Pxfi3HOOSdkjBHCmBPiXA$lOnFpffafl1ZGKHvL5mFjg7asGctlEFtYtMawmIKj8M",
+      "created_at": "2026-03-13T12:47:25.735255Z"
+    }
+  ],
+  "data": {
+    "user-1773406045735": {
+      "chat": [],
+      "moods": [],
+      "reflections": []
+    }
+  }
+}
