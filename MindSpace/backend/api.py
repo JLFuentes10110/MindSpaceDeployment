@@ -129,8 +129,13 @@ def chat_history(user=Depends(_get_current_user)):
 
 @app.post("/api/chat/message")
 def send_chat_message(message: MessageIn, user=Depends(_get_current_user)):
+    # Save the user's message first so it is included in history on the next turn
     add_chat_message(user["id"], "user", message.text)
-    assistant_msg = add_chat_message(user["id"], "assistant", generate_assistant_reply(message.text))
+
+    # --- RAG-enhanced reply: pass user_id so all three phases can fire ---
+    reply_text = generate_assistant_reply(message.text, user_id=user["id"])
+
+    assistant_msg = add_chat_message(user["id"], "assistant", reply_text)
 
     response = {
         "assistant": {

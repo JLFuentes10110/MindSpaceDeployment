@@ -252,7 +252,223 @@ def add_reflection(user_id: str, prompt: str, text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# AI assistant (Groq)
+# RAG helpers
+# ---------------------------------------------------------------------------
+
+# How many recent chat turns to pass as conversation history (Phase 1)
+_HISTORY_WINDOW = 10
+
+# How many mood entries and reflections to surface as personal context (Phase 2)
+_MOOD_WINDOW = 5
+_REFLECTION_WINDOW = 3
+
+
+def _fetch_conversation_history(user_id: str) -> List[Dict[str, str]]:
+    """
+    Phase 1 — Conversation memory.
+
+    Returns the last _HISTORY_WINDOW messages for the user formatted as
+    Groq-compatible message dicts so they can be inserted directly into the
+    `messages` array before the current user turn.
+    """
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.user_id == user_id)
+            .order_by(ChatMessage.timestamp.desc())
+            .limit(_HISTORY_WINDOW)
+            .all()
+        )
+        # Reverse so they are oldest-first, matching conversation order
+        rows = list(reversed(rows))
+        return [
+            {
+                "role": "user" if m.sender == "user" else "assistant",
+                "content": m.message,
+            }
+            for m in rows
+        ]
+    finally:
+        db.close()
+
+
+def _build_personal_context_block(user_id: str) -> str:
+    """
+    Phase 2 — Personal context RAG.
+
+    Queries the user's recent mood logs and reflections and formats them as a
+    plain-text block that is injected into the system prompt so the LLM can
+    reference longitudinal patterns without inventing them.
+
+    No vector database is needed here — we retrieve the N most recent entries
+    by timestamp. This is sufficient when N is small and grows naturally into
+    semantic retrieval (Phase 2b) once data volumes warrant it.
+    """
+    db = SessionLocal()
+    try:
+        # --- Recent mood logs ---
+        mood_rows = (
+            db.query(MoodEntry)
+            .filter(MoodEntry.user_id == user_id)
+            .order_by(MoodEntry.timestamp.desc())
+            .limit(_MOOD_WINDOW)
+            .all()
+        )
+        mood_rows = list(reversed(mood_rows))  # oldest first
+
+        # --- Recent reflections ---
+        reflection_rows = (
+            db.query(Reflection)
+            .filter(Reflection.user_id == user_id)
+            .order_by(Reflection.timestamp.desc())
+            .limit(_REFLECTION_WINDOW)
+            .all()
+        )
+        reflection_rows = list(reversed(reflection_rows))  # oldest first
+
+    finally:
+        db.close()
+
+    if not mood_rows and not reflection_rows:
+        return ""
+
+    lines: List[str] = [
+        "--- USER CONTEXT (use this to personalise your response; do not quote it verbatim) ---"
+    ]
+
+    if mood_rows:
+        lines.append("\nRecent mood check-ins (oldest → newest):")
+        for m in mood_rows:
+            ts = m.timestamp.strftime("%b %d, %Y")
+            lines.append(f"  • {ts}: {m.mood}")
+
+        # Surface a simple pattern signal the LLM can act on
+        recent_moods = [m.mood for m in mood_rows]
+        negative = {"Very Sad", "Sad", "Anxious", "Overwhelmed"}
+        negative_count = sum(1 for mood in recent_moods if mood in negative)
+        if negative_count >= 3:
+            lines.append(
+                f"\n  ⚠ Pattern detected: {negative_count} of the last {len(recent_moods)} "
+                "check-ins show low mood. Acknowledge this gently if relevant."
+            )
+
+    if reflection_rows:
+        lines.append("\nRecent journal reflections (oldest → newest):")
+        for r in reflection_rows:
+            ts = r.timestamp.strftime("%b %d, %Y")
+            # Truncate long reflections so we don't blow the token budget
+            excerpt = r.text[:300] + ("…" if len(r.text) > 300 else "")
+            lines.append(f"  • {ts} [{r.prompt}]: {excerpt}")
+
+    lines.append("--- END USER CONTEXT ---")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Static knowledge base (Filipino mental wellness resources)
+# ---------------------------------------------------------------------------
+
+# This is a lightweight in-process knowledge base. For a production system
+# you would embed these chunks and do semantic search; at this scale a simple
+# keyword match over the user's message is sufficient and adds zero infra cost.
+
+_KNOWLEDGE_BASE: List[Dict[str, Any]] = [
+    {
+        "keywords": ["suicid", "end my life", "kill myself", "don't want to live",
+                     "gusto ko nang mamatay", "ayaw ko na mabuhay", "patay na sana"],
+        "content": (
+            "CRISIS RESOURCE: If the user expresses suicidal ideation, compassionately "
+            "encourage them to call the DOH National Mental Health Crisis Hotline at 1553 "
+            "(free, 24/7, Philippines). They can also text 0917-899-USAP (8727). "
+            "Remind them that reaching out is an act of courage, not weakness."
+        ),
+    },
+    {
+        "keywords": ["therapist", "therapy", "counselor", "counselling", "professional help",
+                     "psychiatrist", "tulong propesyonal", "may makausap"],
+        "content": (
+            "RESOURCE GUIDANCE: When the user asks about professional help, mention that "
+            "affordable options in the Philippines include: barangay health centers (may "
+            "refer to a social worker or psychologist for free), PhilHealth-covered "
+            "outpatient mental health consults, and university guidance offices for students. "
+            "Encourage them to take the step — seeking help is brave."
+        ),
+    },
+    {
+        "keywords": ["anxiety", "anxious", "panic", "pagkabalisa", "takot", "kinakabahan",
+                     "nag-aalala", "stressed", "stress"],
+        "content": (
+            "COPING STRATEGIES FOR ANXIETY: Suggest box breathing (inhale 4s, hold 4s, "
+            "exhale 4s, hold 4s — available in the MindSpace Breathing Exercise tab), "
+            "grounding techniques (5 things you can see, 4 you can touch, etc.), "
+            "and gentle movement like a short walk. Culturally relevant: praying the rosary "
+            "or listening to OPM music can also anchor the nervous system."
+        ),
+    },
+    {
+        "keywords": ["depress", "malungkot", "lungkot", "hopeless", "wala nang pag-asa",
+                     "empty", "walang kwenta", "worthless"],
+        "content": (
+            "SUPPORT GUIDANCE FOR LOW MOOD: Validate first — do not rush to solutions. "
+            "Suggest small, concrete actions: eating a proper meal, stepping outside for "
+            "five minutes, calling a trusted 'ate', 'kuya', or close friend. "
+            "Mention that MindSpace's Daily Reflection feature can help them articulate "
+            "what they're feeling. If symptoms persist, gently encourage professional support."
+        ),
+    },
+    {
+        "keywords": ["family pressure", "pressure ng pamilya", "expectations", "inaasahan",
+                     "pamilya", "magulang", "parents", "hiya", "nahihiya", "shame"],
+        "content": (
+            "CULTURAL CONTEXT: Filipino family dynamics often involve deep obligations and "
+            "'hiya' (shame/face). Acknowledge that feeling caught between personal needs and "
+            "family expectations is a real and common Filipino experience. Validate the "
+            "weight of this without dismissing family bonds. Encourage honest, gentle "
+            "communication or journaling to process before confronting the situation."
+        ),
+    },
+    {
+        "keywords": ["burnout", "exhausted", "pagod na pagod", "sobrang pagod",
+                     "burned out", "walang enerhiya", "no energy"],
+        "content": (
+            "BURNOUT SUPPORT: Normalise rest — 'pahinga muna' is not laziness. Suggest "
+            "identifying one small thing to delegate or drop. Encourage the user to log "
+            "their mood daily so they can spot patterns before burnout deepens. "
+            "Remind them: rest is productive."
+        ),
+    },
+]
+
+
+def _retrieve_knowledge(user_message: str) -> str:
+    """
+    Phase 3 — Knowledge base RAG.
+
+    Scans the user message for keywords and returns the relevant knowledge
+    chunks concatenated as a single block to inject into the system prompt.
+    Multiple chunks can match (e.g. anxiety + family pressure).
+    """
+    message_lower = user_message.lower()
+    matched: List[str] = []
+
+    for entry in _KNOWLEDGE_BASE:
+        if any(kw in message_lower for kw in entry["keywords"]):
+            matched.append(entry["content"])
+
+    if not matched:
+        return ""
+
+    lines = [
+        "--- KNOWLEDGE BASE (internal guidance; never quote directly to the user) ---"
+    ]
+    lines.extend(f"• {chunk}" for chunk in matched)
+    lines.append("--- END KNOWLEDGE BASE ---")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# AI assistant (Groq) — RAG-enhanced
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = (
@@ -260,7 +476,7 @@ _SYSTEM_PROMPT = (
     "You are designed for Filipino users and are fluent in English, Tagalog, Bisaya (Cebuano), and Taglish (Tagalog-English mix). "
     "Automatically detect the language the user writes in and respond naturally in that same language or mix. "
     "If they write in Bisaya, reply in Bisaya. If they mix English and Tagalog, match that energy. "
-    "Use warm, casual Filipino expressions where appropriate — like 'nako', 'ay', 'lodi', 'lodi', 'bes', 'pre', 'kuya', 'ate' — but only when it feels natural, not forced. "
+    "Use warm, casual Filipino expressions where appropriate — like 'nako', 'ay', 'lodi', 'bes', 'pre', 'kuya', 'ate' — but only when it feels natural, not forced. "
     "You understand Filipino cultural context: family pressure (pressure ng pamilya), 'hiya' (shame/embarrassment), "
     "'gigil', 'tampo', 'kilig', and the concept of 'bahala na'. Reference these authentically when relevant. "
     "Suggest coping strategies that fit Filipino life — calling a parent, eating comfort food, praying, talking to a friend, "
@@ -268,7 +484,7 @@ _SYSTEM_PROMPT = (
     "Also, always be mindful of the stigma around mental health in the Philippines. Approach topics with extra sensitivity and empathy, and avoid anything that could feel judgmental or clinical. "
     "And remember, your main goal is to provide a safe, empathetic space for users to express themselves and feel heard. Plus, you can sprinkle in some light humor or playful teasing when it feels right, to help users feel more at ease and connected. "
     "Following through the conversation, you should always be attentive to details, and show that you remember what the user has shared before. If they mention something in a previous message, refer back to it later to show you're really listening. But don't overdo it or make it feel creepy — just a natural, empathetic connection. "
-    
+
     "\n\n"
     "STRICT SCOPE RULE: You only respond to topics related to emotions, mental wellness, feelings, "
     "stress, anxiety, relationships, self-care, and personal reflection. "
@@ -276,7 +492,7 @@ _SYSTEM_PROMPT = (
     "Example: 'Hehe interesting na topic, pero wellness lang ang specialty ko. Kumusta ka talaga?' or respond in any language they used. "
     "Never break character to talk about being an AI or the app itself. If possible to redirect to a wellness topic, do that instead of saying you can't answer. And always respond with empathy and warmth, even when redirecting."
     "When asked for advice, give gentle, non-judgmental suggestions focused on emotional support and self-care, never direct instructions. "
-    "If they ask for resources, suggest general types of resources (like 'talk to a trusted friend or family member', 'consider seeing a counselor or therapist', 'try some self-care activities like going for a walk, journaling, or meditating') rather than specific organizations or hotlines." 
+    "If they ask for resources, suggest general types of resources (like 'talk to a trusted friend or family member', 'consider seeing a counselor or therapist', 'try some self-care activities like going for a walk, journaling, or meditating') rather than specific organizations or hotlines."
     "If they would request for a roleplay, do not roleplay as a therapist or counselor. Instead, roleplay as a supportive friend who listens and offers empathy and encouragement or maybe act as an 'as if' parent, kuya, ate, papa, or boyfriend/girlfriend BUT DON'T OVER DO IT, specially when they would ask something weird especially in a sexual way or harmful way."
     "\n\n"
     "Always respond in a calm, warm, empathetic, non-judgmental tone. "
@@ -287,8 +503,16 @@ _SYSTEM_PROMPT = (
 )
 
 
-def generate_assistant_reply(user_text: str) -> str:
-    """Generate a Groq-powered reply for the given user message."""
+def generate_assistant_reply(user_text: str, user_id: Optional[str] = None) -> str:
+    """
+    Generate a Groq-powered reply using RAG in three phases:
+
+    Phase 1 — Conversation history injected as message turns (session memory).
+    Phase 2 — Personal context block (mood logs + reflections) appended to
+               the system prompt so the LLM has longitudinal user awareness.
+    Phase 3 — Knowledge base retrieval appended to the system prompt when the
+               user message matches wellness-specific keywords.
+    """
     fallback = (
         f"I hear you said: '{user_text}'. "
         "That sounds meaningful, and I'm here to listen. "
@@ -300,19 +524,61 @@ def generate_assistant_reply(user_text: str) -> str:
         print("[chatbot] No GROQ_API_KEY found, using fallback")
         return fallback
 
+    # ------------------------------------------------------------------
+    # Phase 1 — Conversation history
+    # ------------------------------------------------------------------
+    history_messages: List[Dict[str, str]] = []
+    if user_id:
+        history_messages = _fetch_conversation_history(user_id)
+        print(f"[chatbot] Injecting {len(history_messages)} history messages (Phase 1)")
+
+    # ------------------------------------------------------------------
+    # Phase 2 — Personal context block
+    # ------------------------------------------------------------------
+    personal_context = ""
+    if user_id:
+        personal_context = _build_personal_context_block(user_id)
+        if personal_context:
+            print("[chatbot] Personal context block injected (Phase 2)")
+
+    # ------------------------------------------------------------------
+    # Phase 3 — Knowledge base retrieval
+    # ------------------------------------------------------------------
+    knowledge_context = _retrieve_knowledge(user_text)
+    if knowledge_context:
+        print("[chatbot] Knowledge base context injected (Phase 3)")
+
+    # ------------------------------------------------------------------
+    # Assemble the final system prompt
+    # Order matters: system persona → personal context → knowledge base.
+    # Personal context comes first so the LLM anchors on the user before
+    # reading the knowledge guidance.
+    # ------------------------------------------------------------------
+    system_parts = [_SYSTEM_PROMPT]
+    if personal_context:
+        system_parts.append(personal_context)
+    if knowledge_context:
+        system_parts.append(knowledge_context)
+
+    final_system_prompt = "\n\n".join(system_parts)
+
+    # Build the full message list:
+    #   [history turns...] + [current user turn]
+    messages = history_messages + [{"role": "user", "content": user_text}]
+
     try:
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_text},
+                {"role": "system", "content": final_system_prompt},
+                *messages,
             ],
             max_tokens=300,
         )
         ai_text = response.choices[0].message.content.strip()
         if ai_text:
-            print("[chatbot] Groq response used")
+            print("[chatbot] Groq RAG response used")
             return ai_text
         print("[chatbot] Groq returned empty response, using fallback")
     except Exception as e:
